@@ -1,0 +1,31 @@
+name: WarpAFK
+version: ${version}
+main: com.warpmc.afk.WarpAFKPlugin
+api-version: '26.1'
+load: POSTWORLD
+description: Unplugged-AFK port for WarpMC — go unplugged via FakePlayer API
+author: WarpMC Team
+website: https://gitlab.com/Lalaggi/warpMC
+prefix: WarpAFK
+
+permissions:
+  warpmc.afk.unplug:
+    description: Allows using /unplug
+    default: true
+  warpmc.afk.admin:
+    description: Allows using /unplugged-admin
+    default: op
+
+commands:
+  unplug:
+    description: Go unplugged — spawn a bot and disconnect
+    usage: /unplug [minutes] [reason]
+    permission: warpmc.afk.unplug
+  afk:
+    description: Alias for /unplug
+    usage: /afk [minutes] [reason]
+    permission: warpmc.afk.unplug
+  unplugged-admin:
+    description: Admin control for unplugged bots
+    usage: /unplugged-admin <save|reload|purge|spawn|kick|info|list|set>
+    permission: warpmc.afk.admin

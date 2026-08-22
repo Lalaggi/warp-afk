@@ -1,0 +1,26 @@
+# WarpAFK — Unplugged-AFK port for WarpMC
+# Port of https://github.com/sakura-ryoko/unplugged-afk
+
+main:
+  enabled: true
+  debug: false
+
+unplugged:
+  # Default timeout in minutes (129600 = 90 days like upstream). -1 = never.
+  default-timeout-minutes: 129600
+  reset-health-on-death: true
+  disable-damage: false
+  hide-player: false
+  hide-from-ops: false
+
+messages:
+  # Whether to broadcast unplugged start/end to all players
+  broadcast: false
+  hide-join-leave: false
+  # Kick message shown when player successfully unplugs
+  kick-message: "<gold>Your player will be AFK"
+  # Broadcast formats (MiniMessage)
+  started: "<gray><player> is now AFK (<reason>) for <duration>"
+  ended: "<gray><player> is no longer AFK"
+  expired: "<gray><player>'s AFK session expired"
+  replaced: "<gray><player> returned — AFK bot removed"
