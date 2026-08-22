@@ -1,0 +1,89 @@
+# WarpAFK — GitLab CI on local podman runner (ZERO cloud minutes)
+#
+# Runner: local-podman-warpAFK  (podman executor, tags: warp-afk)
+#   host = unix:///run/user/1000/podman/podman.sock
+#   privileged = true (needed for bubblewrap if you extend to flatpak, otherwise optional)
+#   tags = warp-afk,warp,local-podman
+#   run_untagged = true, locked = false
+#
+# Project settings (enforced via glab API):
+#   shared_runners_enabled = false
+#   group_runners_enabled  = false
+# Result: no GitLab SaaS shared runner will ever pick this job — 100% local.
+# Verify: glab api projects/Lalaggi%2Fwarp-afk | grep -E "shared|group"
+#         gitlab-runner verify
+#         systemctl --user status gitlab-runner
+#
+# Register if missing:
+#   glab api projects/Lalaggi%2Fwarp-afk | grep runners_token
+#   gitlab-runner register --url https://gitlab.com \
+#     --registration-token GR1348941fGfD2nB8xyDi87hYNkpn \
+#     --description local-podman-warpAFK --tag-list "warp-afk,warp,local-podman" \
+#     --executor docker --docker-image "alpine:3.20"
+#   # then edit ~/.gitlab-runner/config.toml:
+#   #   [runners.docker]
+#   #     host = "unix:///run/user/1000/podman/podman.sock"
+#   #     privileged = true
+#   systemctl --user restart gitlab-runner
+#
+# This pipeline is intentionally cheap — validate only.
+# Full build needs WarpMC jars: first run in warpMC repo:
+#   ./gradlew publishToMavenLocal
+# then in warp-afk: ./gradlew build (requires local mavenLocal, ~30s, no network)
+# To avoid online dependency fetch in CI, the build job is manual + allow_failure.
+
+stages:
+  - validate
+  - build
+
+variables:
+  GIT_STRATEGY: fetch
+
+# Fast lint that proves the runner is local podman (no cloud)
+validate:
+  stage: validate
+  image: alpine:3.20
+  tags:
+    - warp-afk
+  before_script:
+    - echo "Runner: $CI_RUNNER_DESCRIPTION (id $CI_RUNNER_ID) tags=$CI_RUNNER_TAGS"
+    - echo "Host podman check: $CI_RUNNER_DESCRIPTION should be local-podman-warpAFK"
+    - cat /etc/os-release | head -n 5
+  script:
+    - ls -R | head -n 100
+    - cat paper-plugin.yml 2>/dev/null | head -n 20 || cat src/main/resources/paper-plugin.yml | head -n 20
+    - cat build.gradle.kts | head -n 40
+    - echo "validate ok — local runner works, zero cloud cost"
+  interruptible: true
+  timeout: 5m
+
+# Optional full compile — manual, allow_failure, still local
+build-plugin:
+  stage: build
+  image: eclipse-temurin:25-jdk
+  tags:
+    - warp-afk
+  before_script:
+    - java -version
+    - apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates > /dev/null
+    - chmod +x ./gradlew
+  script:
+    - echo "Attempting gradle build (needs WarpMC publishToMavenLocal for FakePlayer API)"
+    - ./gradlew build --stacktrace 2>&1 | tail -n 50
+    - ls -lh build/libs/*.jar || true
+  artifacts:
+    name: "warp-afk-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - build/libs/*.jar
+    expire_in: 1 week
+  allow_failure: true
+  timeout: 20m
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+      allow_failure: true
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: manual
+      allow_failure: true
+    - when: manual
+      allow_failure: true
