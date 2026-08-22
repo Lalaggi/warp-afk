@@ -57,7 +57,9 @@ validate:
   interruptible: true
   timeout: 5m
 
-# Optional full compile — manual, allow_failure, still local
+# Full compile against WarpMC's custom FakePlayerAPI — manual, allow_failure, still local
+# Your FakePlayer impl lives only in WarpMC, not upstream Purpur, so CI must clone WarpMC
+# and publishToMavenLocal first (otherwise purpur-api:26.1.2.local-SNAPSHOT is missing).
 build-plugin:
   stage: build
   image: eclipse-temurin:25-jdk
@@ -68,11 +70,18 @@ build-plugin:
     - apt-get update -qq
     - apt-get install -y --no-install-recommends git ca-certificates
     - chmod +x ./gradlew
-    - ls -lh gradle/wrapper/ || true
+    - ls -lh gradle/wrapper/
   script:
-    - echo "Attempting gradle build (CI uses purpur snapshot, local uses WarpMC publishToMavenLocal)"
-    - ./gradlew build -PpurpurApiVersion=26.1.2 --stacktrace
+    - echo "Cloning WarpMC for custom FakePlayerAPI (purpur-api:26.1.2.local-SNAPSHOT)"
+    - git clone --depth 1 https://gitlab.com/Lalaggi/warpMC.git /tmp/warpMC
+    - echo "Publishing WarpMC to mavenLocal (~5-10m first run, cached after)"
+    - cd /tmp/warpMC && ./gradlew publishToMavenLocal --parallel -Dorg.gradle.caching=true --stacktrace
+    - ls -lh ~/.m2/repository/org/purpurmc/purpur/purpur-api/26.1.2.local-SNAPSHOT/ || true
+    - cd $CI_PROJECT_DIR
+    - echo "Building warp-afk against WarpMC's FakePlayerAPI"
+    - ./gradlew build --stacktrace
     - ls -lh build/libs/
+  timeout: 45m
   artifacts:
     name: "warp-afk-${CI_COMMIT_SHORT_SHA}"
     paths:
