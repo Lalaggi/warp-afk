@@ -57,14 +57,36 @@ public class AFKManager {
         boolean hide = plugin.getConfig().getBoolean("unplugged.hide-player", false) || plugin.getConfig().getBoolean("unplugged.hide-from-ops", false);
         boolean resetHealth = plugin.getConfig().getBoolean("unplugged.reset-health-on-death", true);
 
+        // Snapshot live data BEFORE spawning/kicking to avoid race where Builder removes real before copy.
+        // This also preserves the exact location (fixes 0,0,0 bug if spawn fails) and inventory.
+        Location savedLoc = player.getLocation().clone();
+        World savedWorld = player.getWorld();
+        // Snapshot inventory/health/etc. for copy after spawn (player may be removed by server's duplicate handling)
+        org.bukkit.inventory.ItemStack[] savedContents = player.getInventory().getContents().clone();
+        org.bukkit.inventory.ItemStack[] savedArmor = player.getInventory().getArmorContents().clone();
+        org.bukkit.inventory.ItemStack savedOffHand = player.getInventory().getItemInOffHand().clone();
+        org.bukkit.inventory.ItemStack[] savedEnder = player.getEnderChest().getContents().clone();
+        double savedHealth = 0; float savedSaturation = 0; int savedFood = 20; float savedExhaustion = 0;
+        float savedExp = 0; int savedLevel = 0; int savedTotalExp = 0;
+        var savedEffects = new ArrayList<>(player.getActivePotionEffects());
+        org.bukkit.GameMode savedGameMode = player.getGameMode();
+        boolean savedAllowFlight = player.getAllowFlight(); boolean savedFlying = player.isFlying();
+        int savedFireTicks = player.getFireTicks(); int savedAir = player.getRemainingAir();
+        try {
+            savedHealth = player.getHealth(); savedFood = player.getFoodLevel(); savedSaturation = player.getSaturation();
+            savedExhaustion = player.getExhaustion(); savedExp = player.getExp(); savedLevel = player.getLevel();
+            savedTotalExp = player.getTotalExperience();
+        } catch (Exception ignored) {}
+
         // If already has fake, remove it first
         if (f.isFakePlayer(player.getUniqueId())) {
             f.removeFakePlayer(player.getUniqueId());
         }
 
+        // Use saved location/world to avoid reading player pos after it may have been removed by duplicate handling
         FakePlayer bot = f.createBuilder(player)
-            .world(player.getWorld())
-            .location(player.getLocation())
+            .world(savedWorld)
+            .location(savedLoc)
             .timeoutMinutes(timeout)
             .reason(reason)
             .damageDisabled(disableDamage)
@@ -72,18 +94,36 @@ public class AFKManager {
             .resetHealthOnDeath(resetHealth)
             .spawn();
 
-        // Inventory etc. was empty — new FakeServerPlayer has fresh NBT (starting kit).
-        // Copy live data from the real player so the bot is a true clone (upstream keeps same entity).
-        // Do this before saveAll/kick so fake's first save doesn't overwrite real's file with empty inv.
-        try { copyLiveData(player, bot); } catch (Exception e) { plugin.getLogger().warning("Failed to copy player data to fake: " + e.getMessage()); }
-
-        // Workaround for WarpMC chunk loader skipping !isRealPlayer (RegionizedPlayerChunkLoader).
-        // Until WarpMC jar is rebuilt, force-load 3x3 around fake so farms tick.
+        // Copy snapshot to bot — true clone (avoids starter-kit). Do this before saveAll so first save is correct.
         try {
-            var cx = bot.getLocation().getBlockX() >> 4;
-            var cz = bot.getLocation().getBlockZ() >> 4;
+            Player dst = (Player) bot;
+            dst.getInventory().setContents(savedContents);
+            dst.getInventory().setArmorContents(savedArmor);
+            dst.getInventory().setItemInOffHand(savedOffHand);
+            try {
+                if (savedHealth > 0) dst.setHealth(Math.min(savedHealth, dst.getMaxHealth()));
+                dst.setFoodLevel(savedFood); dst.setSaturation(savedSaturation); dst.setExhaustion(savedExhaustion);
+                dst.setExp(savedExp); dst.setLevel(savedLevel); dst.setTotalExperience(savedTotalExp);
+                dst.getEnderChest().setContents(savedEnder);
+                for (var eff : savedEffects) dst.addPotionEffect(eff);
+                dst.setGameMode(savedGameMode);
+                if (savedFlying || savedAllowFlight) { dst.setAllowFlight(savedAllowFlight); dst.setFlying(savedFlying); }
+                dst.setFireTicks(savedFireTicks); dst.setRemainingAir(savedAir);
+            } catch (Exception ignored) {}
+        } catch (Exception e) { plugin.getLogger().warning("Failed to copy player data to fake: " + e.getMessage()); }
+
+        // Chunk loading: WarpMC now handles fake players via RegionizedPlayerChunkLoader fix,
+        // but keep 3x3 plugin tickets as fallback until all nodes rebuilt. Use savedLoc for correct chunk.
+        try {
+            var cx = savedLoc.getBlockX() >> 4;
+            var cz = savedLoc.getBlockZ() >> 4;
             for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++)
-                bot.getWorld().addPluginChunkTicket(cx + dx, cz + dz, plugin);
+                savedWorld.addPluginChunkTicket(cx + dx, cz + dz, plugin);
+            // Also verify bot is actually at savedLoc, not 0,0,0 — log warning if still at origin
+            Location botLoc = bot.getLocation();
+            if (botLoc.getWorld() != null && botLoc.distanceSquared(savedLoc) > 4) {
+                plugin.getLogger().warning("AFK bot position mismatch: expected " + savedLoc + " got " + botLoc);
+            }
         } catch (Exception ignored) {}
 
         broadcastStart(player.getName(), reason, timeout);

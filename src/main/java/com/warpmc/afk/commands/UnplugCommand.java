@@ -47,13 +47,28 @@ public class UnplugCommand implements CommandExecutor {
         try {
             manager.spawnForPlayer(player, minutes, reason);
         } catch (Exception e) {
-            player.sendMessage(Component.text("Failed to go AFK: " + e.getMessage(), NamedTextColor.RED));
+            // If spawn failed after removing real (duplicate handling), player may already be offline
+            if (player.isOnline()) {
+                player.sendMessage(Component.text("Failed to go AFK: " + e.getMessage(), NamedTextColor.RED));
+            }
+            manager.getPlugin().getLogger().warning("spawnForPlayer failed for " + player.getName() + ": " + e.getMessage());
+            e.printStackTrace();
             return true;
         }
 
         String kick = managerReasonKickedMessage();
-        // Kick real player — bot stays
-        player.kick(Component.text(kick));
+        // Kick real player — bot stays. Builder/PlayerList may have already removed real to avoid
+        // duplicate UUID Force-added path; only kick if still online.
+        try {
+            if (player.isOnline()) {
+                // Ensure we kick the real player, not the fake (same UUID). Check that Bukkit player is not already a FakePlayer
+                if (!(player instanceof org.purpurmc.purpur.player.FakePlayer)) {
+                    player.kick(Component.text(kick));
+                }
+            }
+        } catch (Exception ignored) {
+            // Player already disconnected by server's real->fake handling — ignore
+        }
         return true;
     }
 
