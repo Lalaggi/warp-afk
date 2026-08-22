@@ -71,6 +71,20 @@ public class AFKManager {
             .resetHealthOnDeath(resetHealth)
             .spawn();
 
+        // Inventory etc. was empty — new FakeServerPlayer has fresh NBT (starting kit).
+        // Copy live data from the real player so the bot is a true clone (upstream keeps same entity).
+        // Do this before saveAll/kick so fake's first save doesn't overwrite real's file with empty inv.
+        try { copyLiveData(player, bot); } catch (Exception e) { plugin.getLogger().warning("Failed to copy player data to fake: " + e.getMessage()); }
+
+        // Workaround for WarpMC chunk loader skipping !isRealPlayer (RegionizedPlayerChunkLoader).
+        // Until WarpMC jar is rebuilt, force-load 3x3 around fake so farms tick.
+        try {
+            var cx = bot.getLocation().getBlockX() >> 4;
+            var cz = bot.getLocation().getBlockZ() >> 4;
+            for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++)
+                bot.getWorld().addPluginChunkTicket(cx + dx, cz + dz, plugin);
+        } catch (Exception ignored) {}
+
         broadcastStart(player.getName(), reason, timeout);
         saveAll();
         return bot;
@@ -111,6 +125,38 @@ public class AFKManager {
             // broadcastEnd is handled by caller or quit listener
         }
         return removed;
+    }
+
+    // Deep-copy live data so fake starts identical to real player (avoids starter-kit / empty inv)
+    private void copyLiveData(Player src, FakePlayer dst) {
+        // Bukkit-level — covers most of what gets saved to .dat (inventory, ender chest, xp, health, food, etc.)
+        dst.getInventory().setContents(src.getInventory().getContents());
+        dst.getInventory().setArmorContents(src.getInventory().getArmorContents());
+        dst.getInventory().setItemInOffHand(src.getInventory().getItemInOffHand());
+        try {
+            // Health / food / xp / effects via Bukkit (avoids NMS CraftPlayer mapping issues)
+            dst.setHealth(src.getHealth());
+            dst.setFoodLevel(src.getFoodLevel());
+            dst.setSaturation(src.getSaturation());
+            dst.setExhaustion(src.getExhaustion());
+            dst.setSaturatedRegenRate(src.getSaturatedRegenRate());
+            dst.setUnsaturatedRegenRate(src.getUnsaturatedRegenRate());
+            dst.setStarvationRate(src.getStarvationRate());
+            dst.setExp(src.getExp());
+            dst.setLevel(src.getLevel());
+            dst.setTotalExperience(src.getTotalExperience());
+            // Ender chest
+            dst.getEnderChest().setContents(src.getEnderChest().getContents());
+            // Potion effects
+            for (var eff : src.getActivePotionEffects()) dst.addPotionEffect(eff);
+            dst.setGameMode(src.getGameMode());
+            if (src.isFlying() || src.getAllowFlight()) {
+                dst.setAllowFlight(src.getAllowFlight());
+                dst.setFlying(src.isFlying());
+            }
+            dst.setFireTicks(src.getFireTicks());
+            dst.setRemainingAir(src.getRemainingAir());
+        } catch (Exception ignored) {}
     }
 
     public Collection<FakePlayer> getAll() {
@@ -229,7 +275,16 @@ public class AFKManager {
                     .hidden(s.hidden)
                     .resetHealthOnDeath(s.resetHealthOnDeath);
                 // Preserve original spawnTime semantics by spawning now but with remaining timeout
-                builder.spawn();
+                FakePlayer spawned = builder.spawn();
+                // Force-load for farm until WarpMC jar rebuilt (RegionizedPlayerChunkLoader fix)
+                try {
+                    var cx = loc.getBlockX() >> 4; var cz = loc.getBlockZ() >> 4;
+                    for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++)
+                        spawned.getWorld().addPluginChunkTicket(cx + dx, cz + dz, plugin);
+                } catch (Exception ignored) {}
+                // Note: inventory across restarts is persisted via vanilla .dat save (fake's last save before shutdown).
+                // On restore we spawn fresh empty fake — inventory will be overwritten by next save if not copied.
+                // For now, copyLiveData covers /unplug path; restart case needs SavedFake inventory serialization (TODO).
                 restored++;
             } catch (Exception e) {
                 plugin.getLogger().log(Level.WARNING, "Failed to restore fake " + s.name + " (" + s.uuid + ")", e);
