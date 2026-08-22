@@ -5,6 +5,9 @@ import com.warpmc.afk.commands.UnplugCommand;
 import com.warpmc.afk.commands.UnpluggedAdminCommand;
 import com.warpmc.afk.listener.PlayerListener;
 import com.warpmc.afk.manager.AFKManager;
+import io.papermc.paper.command.brigadier.BasicCommand;
+import io.papermc.paper.command.brigadier.CommandSourceStack;
+import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
 import org.bukkit.plugin.java.JavaPlugin;
 
 public final class WarpAFKPlugin extends JavaPlugin {
@@ -27,11 +30,29 @@ public final class WarpAFKPlugin extends JavaPlugin {
         var admin = new UnpluggedAdminCommand(afkManager);
         var afk = new AfkCommand(afkManager);
 
-        var pm = getServer().getPluginManager();
-        // Register via commands map (paper-plugin.yml already declares them, but we set executors via getCommand)
-        if (getCommand("unplug") != null) getCommand("unplug").setExecutor(unplug);
-        if (getCommand("afk") != null) getCommand("afk").setExecutor(afk);
-        if (getCommand("unplugged-admin") != null) getCommand("unplugged-admin").setExecutor(admin);
+        // Paper plugins (paper-plugin.yml) cannot use JavaPlugin#getCommand during enable —
+        // must use LifecycleEvents.COMMANDS + BasicCommand (Paper 1.21+)
+        var lifecycle = this.getLifecycleManager();
+        lifecycle.registerEventHandler(LifecycleEvents.COMMANDS, event -> {
+            var registrar = event.registrar();
+            registrar.register("unplug", "Go unplugged — spawn a bot and disconnect", new BasicCommand() {
+                @Override public void execute(CommandSourceStack stack, String[] args) { unplug.onCommand(stack.getSender(), null, "unplug", args); }
+                @Override public String permission() { return "warpmc.afk.unplug"; }
+            });
+            registrar.register("afk", "Alias for /unplug", new BasicCommand() {
+                @Override public void execute(CommandSourceStack stack, String[] args) { afk.onCommand(stack.getSender(), null, "afk", args); }
+                @Override public String permission() { return "warpmc.afk.unplug"; }
+            });
+            registrar.register("unplugged-admin", "Admin control for unplugged bots", new BasicCommand() {
+                @Override public void execute(CommandSourceStack stack, String[] args) { admin.onCommand(stack.getSender(), null, "unplugged-admin", args); }
+                @Override public String permission() { return "warpmc.afk.admin"; }
+                @Override public java.util.Collection<String> suggest(CommandSourceStack stack, String[] args) {
+                    if (args.length == 1) return java.util.List.of("save","reload","purge","spawn","kick","info","list","set");
+                    if (args.length == 2 && args[0].equalsIgnoreCase("list")) return java.util.List.of("players","unplugged","all");
+                    return java.util.List.of();
+                }
+            });
+        });
 
         // Restore persisted bots slightly delayed (chunks may not be loaded yet)
         getServer().getScheduler().runTaskLater(this, () -> afkManager.restoreAllDelayed(), 40L);
