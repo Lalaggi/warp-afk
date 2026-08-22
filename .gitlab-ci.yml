@@ -46,14 +46,14 @@ validate:
   tags:
     - warp-afk
   before_script:
-    - echo "Runner: $CI_RUNNER_DESCRIPTION (id $CI_RUNNER_ID) tags=$CI_RUNNER_TAGS"
-    - echo "Host podman check: $CI_RUNNER_DESCRIPTION should be local-podman-warpAFK"
-    - cat /etc/os-release | head -n 5
+    - echo "Runner is $CI_RUNNER_DESCRIPTION"
+    - echo "Tags are $CI_RUNNER_TAGS"
+    - cat /etc/os-release
   script:
-    - ls -R | head -n 100
-    - cat paper-plugin.yml 2>/dev/null | head -n 20 || cat src/main/resources/paper-plugin.yml | head -n 20
-    - cat build.gradle.kts | head -n 40
-    - echo "validate ok — local runner works, zero cloud cost"
+    - ls -R
+    - cat src/main/resources/paper-plugin.yml
+    - cat build.gradle.kts
+    - echo "validate ok - local runner works, zero cloud cost"
   interruptible: true
   timeout: 5m
 
@@ -65,12 +65,13 @@ build-plugin:
     - warp-afk
   before_script:
     - java -version
-    - apt-get update -qq && apt-get install -y --no-install-recommends git ca-certificates > /dev/null
+    - apt-get update -qq
+    - apt-get install -y --no-install-recommends git ca-certificates
     - chmod +x ./gradlew
   script:
     - echo "Attempting gradle build (needs WarpMC publishToMavenLocal for FakePlayer API)"
-    - ./gradlew build --stacktrace 2>&1 | tail -n 50
-    - ls -lh build/libs/*.jar || true
+    - ./gradlew build --stacktrace
+    - ls -lh build/libs/
   artifacts:
     name: "warp-afk-${CI_COMMIT_SHORT_SHA}"
     paths:
