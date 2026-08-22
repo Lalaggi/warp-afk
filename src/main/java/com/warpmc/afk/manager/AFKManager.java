@@ -50,10 +50,11 @@ public class AFKManager {
     public FakePlayer spawnForPlayer(Player player, long minutes, String reason) {
         FakePlayerFactory f = factory();
         if (f == null) throw new IllegalStateException("FakePlayerFactory unavailable — not running WarpMC?");
+        if (!plugin.getConfig().getBoolean("main.enabled", true)) throw new IllegalStateException("WarpAFK is disabled in config (main.enabled=false)");
 
         long timeout = minutes <= 0 ? getDefaultTimeout() : minutes;
         boolean disableDamage = plugin.getConfig().getBoolean("unplugged.disable-damage", false);
-        boolean hide = plugin.getConfig().getBoolean("unplugged.hide-player", false);
+        boolean hide = plugin.getConfig().getBoolean("unplugged.hide-player", false) || plugin.getConfig().getBoolean("unplugged.hide-from-ops", false);
         boolean resetHealth = plugin.getConfig().getBoolean("unplugged.reset-health-on-death", true);
 
         // If already has fake, remove it first
@@ -93,9 +94,10 @@ public class AFKManager {
     public FakePlayer spawnForOffline(UUID uuid, String name, World world, Location loc, long minutes, String reason) {
         FakePlayerFactory f = factory();
         if (f == null) throw new IllegalStateException("FakePlayerFactory unavailable");
+        if (!plugin.getConfig().getBoolean("main.enabled", true)) throw new IllegalStateException("WarpAFK is disabled in config (main.enabled=false)");
         long timeout = minutes <= 0 ? getDefaultTimeout() : minutes;
         boolean disableDamage = plugin.getConfig().getBoolean("unplugged.disable-damage", false);
-        boolean hide = plugin.getConfig().getBoolean("unplugged.hide-player", false);
+        boolean hide = plugin.getConfig().getBoolean("unplugged.hide-player", false) || plugin.getConfig().getBoolean("unplugged.hide-from-ops", false);
         boolean resetHealth = plugin.getConfig().getBoolean("unplugged.reset-health-on-death", true);
 
         if (f.isFakePlayer(uuid)) f.removeFakePlayer(uuid);
@@ -215,6 +217,28 @@ public class AFKManager {
                 s.hidden = fp.isHidden();
                 s.resetHealthOnDeath = fp.isResetHealthOnDeath();
                 s.spawnTimeMillis = fp.getSpawnTime() != null ? fp.getSpawnTime().toEpochMilli() : System.currentTimeMillis();
+                // Persist player state so restart keeps inventory/gamemode (otherwise starter kit)
+                try {
+                    Player p = (Player) fp;
+                    s.gameMode = p.getGameMode().name();
+                    s.health = p.getHealth();
+                    s.foodLevel = p.getFoodLevel();
+                    s.saturation = p.getSaturation();
+                    s.exhaustion = p.getExhaustion();
+                    s.exp = p.getExp();
+                    s.level = p.getLevel();
+                    s.totalExperience = p.getTotalExperience();
+                    s.inventory = serializeItems(p.getInventory().getStorageContents());
+                    s.armor = serializeItems(p.getInventory().getArmorContents());
+                    var off = p.getInventory().getItemInOffHand();
+                    if (off != null && !off.getType().isAir()) s.offHand = off.serialize();
+                    else s.offHand = null;
+                    s.enderChest = serializeItems(p.getEnderChest().getStorageContents());
+                    s.potionEffects = new ArrayList<>();
+                    for (var eff : p.getActivePotionEffects()) s.potionEffects.add(eff.serialize());
+                } catch (Exception ex) {
+                    plugin.getLogger().warning("Failed to snapshot inventory for " + s.name + ": " + ex.getMessage());
+                }
                 list.add(s);
             }
             if (!plugin.getDataFolder().exists()) plugin.getDataFolder().mkdirs();
@@ -224,6 +248,44 @@ public class AFKManager {
         } catch (Exception e) {
             plugin.getLogger().log(Level.WARNING, "Failed to save unplugged.json", e);
         }
+    }
+
+    private java.util.List<java.util.Map<String, Object>> serializeItems(org.bukkit.inventory.ItemStack[] items) {
+        var out = new ArrayList<java.util.Map<String, Object>>();
+        for (var it : items) {
+            if (it == null || it.getType().isAir()) out.add(null);
+            else out.add(it.serialize());
+        }
+        return out;
+    }
+
+    private org.bukkit.inventory.ItemStack[] deserializeItems(java.util.List<java.util.Map<String, Object>> list, int expected) {
+        var out = new org.bukkit.inventory.ItemStack[expected];
+        if (list == null) return out;
+        for (int i = 0; i < Math.min(list.size(), expected); i++) {
+            var m = list.get(i);
+            if (m == null) out[i] = null;
+            else try { out[i] = org.bukkit.inventory.ItemStack.deserialize(m); } catch (Exception ignored) { out[i] = null; }
+        }
+        return out;
+    }
+
+    private void restoreLiveDataFromSaved(Player dst, SavedFake s) {
+        try { if (s.gameMode != null) dst.setGameMode(org.bukkit.GameMode.valueOf(s.gameMode)); } catch (Exception ignored) {}
+        try { if (s.health > 0) dst.setHealth(Math.min(s.health, dst.getMaxHealth())); } catch (Exception ignored) {}
+        try { dst.setFoodLevel(s.foodLevel); } catch (Exception ignored) {}
+        try { dst.setSaturation(s.saturation); } catch (Exception ignored) {}
+        try { dst.setExhaustion(s.exhaustion); } catch (Exception ignored) {}
+        try { dst.setExp(s.exp); } catch (Exception ignored) {}
+        try { dst.setLevel(s.level); } catch (Exception ignored) {}
+        try { dst.setTotalExperience(s.totalExperience); } catch (Exception ignored) {}
+        try {
+            if (s.inventory != null) dst.getInventory().setStorageContents(deserializeItems(s.inventory, dst.getInventory().getStorageContents().length));
+            if (s.armor != null) dst.getInventory().setArmorContents(deserializeItems(s.armor, dst.getInventory().getArmorContents().length));
+            if (s.offHand != null) try { dst.getInventory().setItemInOffHand(org.bukkit.inventory.ItemStack.deserialize(s.offHand)); } catch (Exception ignored) {}
+            if (s.enderChest != null) dst.getEnderChest().setStorageContents(deserializeItems(s.enderChest, dst.getEnderChest().getStorageContents().length));
+            if (s.potionEffects != null) for (var m : s.potionEffects) try { dst.addPotionEffect(new org.bukkit.potion.PotionEffect(m)); } catch (Exception ignored) {}
+        } catch (Exception ignored) {}
     }
 
     public List<SavedFake> loadPersistedData() {
@@ -282,9 +344,8 @@ public class AFKManager {
                     for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++)
                         spawned.getWorld().addPluginChunkTicket(cx + dx, cz + dz, plugin);
                 } catch (Exception ignored) {}
-                // Note: inventory across restarts is persisted via vanilla .dat save (fake's last save before shutdown).
-                // On restore we spawn fresh empty fake — inventory will be overwritten by next save if not copied.
-                // For now, copyLiveData covers /unplug path; restart case needs SavedFake inventory serialization (TODO).
+                // Restore persisted inventory/gamemode/health so restart doesn't reset to starter kit
+                try { restoreLiveDataFromSaved((Player) spawned, s); } catch (Exception ex) { plugin.getLogger().warning("Failed to restore inventory for " + s.name + ": " + ex.getMessage()); }
                 restored++;
             } catch (Exception e) {
                 plugin.getLogger().log(Level.WARNING, "Failed to restore fake " + s.name + " (" + s.uuid + ")", e);
