@@ -68,9 +68,10 @@ build-plugin:
     - apt-get update -qq
     - apt-get install -y --no-install-recommends git ca-certificates
     - chmod +x ./gradlew
+    - ls -lh gradle/wrapper/ || true
   script:
-    - echo "Attempting gradle build (needs WarpMC publishToMavenLocal for FakePlayer API)"
-    - ./gradlew build --stacktrace
+    - echo "Attempting gradle build (CI uses purpur snapshot, local uses WarpMC publishToMavenLocal)"
+    - ./gradlew build -PpurpurApiVersion=26.1.2 --stacktrace
     - ls -lh build/libs/
   artifacts:
     name: "warp-afk-${CI_COMMIT_SHORT_SHA}"

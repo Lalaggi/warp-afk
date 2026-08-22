@@ -21,7 +21,7 @@ repositories {
 }
 
 dependencies {
-    compileOnly("org.purpurmc.purpur:purpur-api:26.1.2.local-SNAPSHOT")
+    compileOnly("org.purpurmc.purpur:purpur-api:${project.findProperty("purpurApiVersion") ?: "26.1.2.local-SNAPSHOT"}")
     implementation("com.google.code.gson:gson:2.10.1")
 }
 
