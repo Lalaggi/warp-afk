@@ -4,31 +4,53 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.reflect.TypeToken;
 import com.warpmc.afk.WarpAFKPlugin;
-import com.warpmc.afk.storage.SavedFake;
-import java.io.File;
-import java.io.FileReader;
-import java.io.FileWriter;
-import java.lang.reflect.Type;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.List;
-import java.util.UUID;
-import java.util.logging.Level;
+import com.warpmc.afk.util.DurationParser;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.minimessage.MiniMessage;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
+import org.bukkit.event.Listener;
 import org.purpurmc.purpur.Purpur;
 import org.purpurmc.purpur.player.FakePlayer;
 import org.purpurmc.purpur.player.FakePlayerFactory;
+import org.purpurmc.purpur.event.FakePlayerSpawnEvent;
+import org.purpurmc.purpur.event.FakePlayerRemoveEvent;
 
-public class AFKManager {
+import java.io.File;
+import java.io.FileReader;
+import java.lang.reflect.Type;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.logging.Level;
+
+/**
+ * Manages AFK fake players for WarpAFK.
+ * <p>
+ * Relies on the enhanced FakePlayer API for:
+ * <ul>
+ *   <li>Built-in persistence ({@link FakePlayerFactory#saveAll(File)} / {@link FakePlayerFactory#loadAll(File, Consumer)})</li>
+ *   <li>Per-viewer visibility ({@code hiddenFromNonOps})</li>
+ *   <li>Native chunk loading (no plugin ticket workarounds needed)</li>
+ *   <li>Lifecycle events ({@link FakePlayerSpawnEvent}, {@link FakePlayerRemoveEvent})</li>
+ * </ul>
+ */
+public class AFKManager implements Listener {
 
     private final WarpAFKPlugin plugin;
-    private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
     private final File persistFile;
+    private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
+
+    // Debounce: only save to disk at most once every 2 seconds
+    private long lastSaveMillis = 0;
+    private boolean savePending = false;
+    private int saveTaskId = -1;
 
     public AFKManager(WarpAFKPlugin plugin) {
         this.plugin = plugin;
@@ -47,149 +69,122 @@ public class AFKManager {
 
     // --- core spawn ---
 
+    /**
+     * Spawns an AFK bot for a real player. The real player is expected to be
+     * kicked by the caller after this returns.
+     */
     public FakePlayer spawnForPlayer(Player player, long minutes, String reason) {
         FakePlayerFactory f = factory();
         if (f == null) throw new IllegalStateException("FakePlayerFactory unavailable — not running WarpMC?");
-        if (!plugin.getConfig().getBoolean("main.enabled", true)) throw new IllegalStateException("WarpAFK is disabled in config (main.enabled=false)");
+        if (!plugin.getConfig().getBoolean("main.enabled", true))
+            throw new IllegalStateException("WarpAFK is disabled in config (main.enabled=false)");
 
         long timeout = minutes <= 0 ? getDefaultTimeout() : minutes;
         boolean disableDamage = plugin.getConfig().getBoolean("unplugged.disable-damage", false);
-        boolean hide = plugin.getConfig().getBoolean("unplugged.hide-player", false) || plugin.getConfig().getBoolean("unplugged.hide-from-ops", false);
-        boolean resetHealth = plugin.getConfig().getBoolean("unplugged.reset-health-on-death", true);
+        boolean hidePlayer = plugin.getConfig().getBoolean("unplugged.hide-player", false);
+        boolean hideFromOps = plugin.getConfig().getBoolean("unplugged.hide-from-ops", false);
+        boolean resetHealth = plugin.getConfig().getBoolean("unplugged.reset-health-on-death", false);
+        boolean suppressJoinLeave = plugin.getConfig().getBoolean("messages.hide-join-leave", false);
+        boolean displayDuration = plugin.getConfig().getBoolean("messages.display-duration", false);
 
-        // Snapshot live data BEFORE spawning/kicking to avoid race where Builder removes real before copy.
-        // This also preserves the exact location (fixes 0,0,0 bug if spawn fails) and inventory.
-        Location savedLoc = player.getLocation().clone();
-        World savedWorld = player.getWorld();
-        // Snapshot inventory/health/etc. for copy after spawn (player may be removed by server's duplicate handling)
-        org.bukkit.inventory.ItemStack[] savedContents = player.getInventory().getContents().clone();
-        org.bukkit.inventory.ItemStack[] savedArmor = player.getInventory().getArmorContents().clone();
-        org.bukkit.inventory.ItemStack savedOffHand = player.getInventory().getItemInOffHand().clone();
-        org.bukkit.inventory.ItemStack[] savedEnder = player.getEnderChest().getContents().clone();
-        double savedHealth = 0; float savedSaturation = 0; int savedFood = 20; float savedExhaustion = 0;
-        float savedExp = 0; int savedLevel = 0; int savedTotalExp = 0;
-        var savedEffects = new ArrayList<>(player.getActivePotionEffects());
-        org.bukkit.GameMode savedGameMode = player.getGameMode();
-        boolean savedAllowFlight = player.getAllowFlight(); boolean savedFlying = player.isFlying();
-        int savedFireTicks = player.getFireTicks(); int savedAir = player.getRemainingAir();
-        try {
-            savedHealth = player.getHealth(); savedFood = player.getFoodLevel(); savedSaturation = player.getSaturation();
-            savedExhaustion = player.getExhaustion(); savedExp = player.getExp(); savedLevel = player.getLevel();
-            savedTotalExp = player.getTotalExperience();
-        } catch (Exception ignored) {}
-
-        // If already has fake, remove it first
+        // Evict existing fake with same UUID to prevent duplicates
         if (f.isFakePlayer(player.getUniqueId())) {
             f.removeFakePlayer(player.getUniqueId());
         }
 
-        // Use saved location/world to avoid reading player pos after it may have been removed by duplicate handling
+        // Snapshot live data before spawn (player may be removed by server's duplicate handling)
+        Location savedLoc = player.getLocation().clone();
+        World savedWorld = player.getWorld();
+
         FakePlayer bot = f.createBuilder(player)
             .world(savedWorld)
             .location(savedLoc)
             .timeoutMinutes(timeout)
             .reason(reason)
             .damageDisabled(disableDamage)
-            .hidden(hide)
+            .hidden(hidePlayer)
+            .hiddenFromNonOps(hideFromOps)
             .resetHealthOnDeath(resetHealth)
+            .suppressJoinLeaveMessages(suppressJoinLeave)
+            .displayDuration(displayDuration)
             .spawn();
 
-        // Copy snapshot to bot — true clone (avoids starter-kit). Do this before saveAll so first save is correct.
-        try {
-            Player dst = (Player) bot;
-            dst.getInventory().setContents(savedContents);
-            dst.getInventory().setArmorContents(savedArmor);
-            dst.getInventory().setItemInOffHand(savedOffHand);
-            try {
-                if (savedHealth > 0) dst.setHealth(Math.min(savedHealth, dst.getMaxHealth()));
-                dst.setFoodLevel(savedFood); dst.setSaturation(savedSaturation); dst.setExhaustion(savedExhaustion);
-                dst.setExp(savedExp); dst.setLevel(savedLevel); dst.setTotalExperience(savedTotalExp);
-                dst.getEnderChest().setContents(savedEnder);
-                for (var eff : savedEffects) dst.addPotionEffect(eff);
-                dst.setGameMode(savedGameMode);
-                if (savedFlying || savedAllowFlight) { dst.setAllowFlight(savedAllowFlight); dst.setFlying(savedFlying); }
-                dst.setFireTicks(savedFireTicks); dst.setRemainingAir(savedAir);
-            } catch (Exception ignored) {}
-        } catch (Exception e) { plugin.getLogger().warning("Failed to copy player data to fake: " + e.getMessage()); }
-
-        // Chunk loading: WarpMC now handles fake players via RegionizedPlayerChunkLoader fix,
-        // but keep 3x3 plugin tickets as fallback until all nodes rebuilt. Use savedLoc for correct chunk.
-        try {
-            var cx = savedLoc.getBlockX() >> 4;
-            var cz = savedLoc.getBlockZ() >> 4;
-            for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++)
-                savedWorld.addPluginChunkTicket(cx + dx, cz + dz, plugin);
-            // Also verify bot is actually at savedLoc, not 0,0,0 — log warning if still at origin
-            Location botLoc = bot.getLocation();
-            if (botLoc.getWorld() != null && botLoc.distanceSquared(savedLoc) > 4) {
-                plugin.getLogger().warning("AFK bot position mismatch: expected " + savedLoc + " got " + botLoc);
-            }
-        } catch (Exception ignored) {}
+        // Copy live player data to bot so it starts as a true clone
+        try { copyLiveData(player, bot); } catch (Exception e) {
+            plugin.getLogger().warning("Failed to copy player data to fake: " + e.getMessage());
+        }
 
         broadcastStart(player.getName(), reason, timeout);
-        saveAll();
+        // Persistence is handled by FakePlayerSpawnEvent listener (debounced saveAll)
         return bot;
     }
 
-    public FakePlayer spawnForOffline(UUID uuid, String name, World world, Location loc, long minutes, String reason) {
+    public FakePlayer spawnForOffline(UUID uuid, String name, World world, Location loc,
+                                      long minutes, String reason) {
         FakePlayerFactory f = factory();
         if (f == null) throw new IllegalStateException("FakePlayerFactory unavailable");
-        if (!plugin.getConfig().getBoolean("main.enabled", true)) throw new IllegalStateException("WarpAFK is disabled in config (main.enabled=false)");
+        if (!plugin.getConfig().getBoolean("main.enabled", true))
+            throw new IllegalStateException("WarpAFK is disabled in config (main.enabled=false)");
+
         long timeout = minutes <= 0 ? getDefaultTimeout() : minutes;
         boolean disableDamage = plugin.getConfig().getBoolean("unplugged.disable-damage", false);
-        boolean hide = plugin.getConfig().getBoolean("unplugged.hide-player", false) || plugin.getConfig().getBoolean("unplugged.hide-from-ops", false);
-        boolean resetHealth = plugin.getConfig().getBoolean("unplugged.reset-health-on-death", true);
+        boolean hidePlayer = plugin.getConfig().getBoolean("unplugged.hide-player", false);
+        boolean hideFromOps = plugin.getConfig().getBoolean("unplugged.hide-from-ops", false);
+        boolean resetHealth = plugin.getConfig().getBoolean("unplugged.reset-health-on-death", false);
+        boolean suppressJoinLeave = plugin.getConfig().getBoolean("messages.hide-join-leave", false);
+        boolean displayDuration = plugin.getConfig().getBoolean("messages.display-duration", false);
 
         if (f.isFakePlayer(uuid)) f.removeFakePlayer(uuid);
 
-        Location spawnLoc = loc != null ? loc : (world != null ? new Location(world, 0, world.getHighestBlockYAt(0,0)+1, 0) : null);
-        var builder = f.createBuilder(uuid, name);
-        if (world != null) builder.world(world);
-        if (spawnLoc != null) builder.location(spawnLoc);
-        FakePlayer bot = builder
+        Location spawnLoc = loc != null ? loc : (world != null ? new Location(world, 0, world.getHighestBlockYAt(0, 0) + 1, 0) : null);
+
+        FakePlayer bot = f.createBuilder(uuid, name)
+            .world(world)
+            .location(spawnLoc)
             .timeoutMinutes(timeout)
             .reason(reason)
             .damageDisabled(disableDamage)
-            .hidden(hide)
+            .hidden(hidePlayer)
+            .hiddenFromNonOps(hideFromOps)
             .resetHealthOnDeath(resetHealth)
+            .suppressJoinLeaveMessages(suppressJoinLeave)
+            .displayDuration(displayDuration)
             .spawn();
+
         broadcastStart(name, reason, timeout);
-        saveAll();
         return bot;
     }
 
     public boolean remove(UUID uuid) {
         FakePlayerFactory f = factory();
         if (f == null) return false;
+        // Capture name before removal for broadcast
+        FakePlayer fp = f.getFakePlayer(uuid);
+        String name = fp != null ? fp.getName() : null;
         boolean removed = f.removeFakePlayer(uuid);
-        if (removed) {
-            saveAll();
-            // broadcastEnd is handled by caller or quit listener
+        if (removed && name != null) {
+            broadcastEnd(name, "terminated");
         }
         return removed;
     }
 
-    // Deep-copy live data so fake starts identical to real player (avoids starter-kit / empty inv)
+    /**
+     * Deep-copy live data from a real player to a fake player so the bot starts
+     * as a true clone (inventory, health, gamemode, cooldowns, etc.).
+     */
     private void copyLiveData(Player src, FakePlayer dst) {
-        // Bukkit-level — covers most of what gets saved to .dat (inventory, ender chest, xp, health, food, etc.)
         dst.getInventory().setContents(src.getInventory().getContents());
         dst.getInventory().setArmorContents(src.getInventory().getArmorContents());
         dst.getInventory().setItemInOffHand(src.getInventory().getItemInOffHand());
         try {
-            // Health / food / xp / effects via Bukkit (avoids NMS CraftPlayer mapping issues)
             dst.setHealth(src.getHealth());
             dst.setFoodLevel(src.getFoodLevel());
             dst.setSaturation(src.getSaturation());
             dst.setExhaustion(src.getExhaustion());
-            dst.setSaturatedRegenRate(src.getSaturatedRegenRate());
-            dst.setUnsaturatedRegenRate(src.getUnsaturatedRegenRate());
-            dst.setStarvationRate(src.getStarvationRate());
             dst.setExp(src.getExp());
             dst.setLevel(src.getLevel());
             dst.setTotalExperience(src.getTotalExperience());
-            // Ender chest
             dst.getEnderChest().setContents(src.getEnderChest().getContents());
-            // Potion effects
             for (var eff : src.getActivePotionEffects()) dst.addPotionEffect(eff);
             dst.setGameMode(src.getGameMode());
             if (src.isFlying() || src.getAllowFlight()) {
@@ -212,12 +207,35 @@ public class AFKManager {
     private void broadcastStart(String playerName, String reason, long minutes) {
         if (!plugin.getConfig().getBoolean("messages.broadcast", false)) return;
         String tmpl = plugin.getConfig().getString("messages.started", "<gray><player> is now AFK");
+        boolean displayDur = plugin.getConfig().getBoolean("messages.display-duration", false);
         String duration = formatDuration(minutes);
+        String timeDate = java.time.LocalDateTime.now()
+            .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"));
         String msg = tmpl.replace("<player>", playerName)
             .replace("<reason>", reason != null ? reason : "")
-            .replace("<duration>", duration);
-        Component comp = MiniMessage.miniMessage().deserialize(msg);
-        Bukkit.broadcast(comp);
+            .replace("<duration>", displayDur ? duration : "")
+            .replace("<timeDate>", timeDate);
+        Bukkit.broadcast(MiniMessage.miniMessage().deserialize(msg));
+    }
+
+    public void broadcastEnd(String playerName, String type) {
+        if (!plugin.getConfig().getBoolean("messages.broadcast", false)) return;
+        boolean displayReturnFeedback = plugin.getConfig().getBoolean("messages.display-return-feedback", false);
+        if (!displayReturnFeedback && !type.equals("terminated")) return;
+
+        String key = switch (type) {
+            case "expired" -> "messages.expired";
+            case "replaced" -> "messages.replaced";
+            case "terminated" -> "messages.terminated";
+            default -> "messages.ended";
+        };
+        String tmpl = plugin.getConfig().getString(key, "<gray><player> is no longer AFK");
+        if (tmpl == null) return;
+        String timeDate = java.time.LocalDateTime.now()
+            .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"));
+        String msg = tmpl.replace("<player>", playerName)
+            .replace("<timeDate>", timeDate);
+        Bukkit.broadcast(MiniMessage.miniMessage().deserialize(msg));
     }
 
     private String formatDuration(long minutes) {
@@ -233,167 +251,51 @@ public class AFKManager {
         return plugin.getConfig().getLong("unplugged.default-timeout-minutes", 129600L);
     }
 
-    // --- persistence ---
+    // --- persistence (delegated to FakePlayerFactory) ---
 
     public void saveAll() {
         try {
             FakePlayerFactory f = factory();
             if (f == null) return;
-            List<SavedFake> list = new ArrayList<>();
-            for (FakePlayer fp : f.getActiveFakePlayers()) {
-                Location loc = fp.getLocation();
-                SavedFake s = new SavedFake();
-                s.uuid = fp.getUniqueId().toString();
-                s.name = fp.getName();
-                s.world = loc.getWorld() != null ? loc.getWorld().getName() : null;
-                s.x = loc.getX();
-                s.y = loc.getY();
-                s.z = loc.getZ();
-                s.yaw = loc.getYaw();
-                s.pitch = loc.getPitch();
-                s.timeoutMinutes = fp.getTimeoutMinutes();
-                s.reason = fp.getReason();
-                s.damageDisabled = fp.isDamageDisabled();
-                s.hidden = fp.isHidden();
-                s.resetHealthOnDeath = fp.isResetHealthOnDeath();
-                s.spawnTimeMillis = fp.getSpawnTime() != null ? fp.getSpawnTime().toEpochMilli() : System.currentTimeMillis();
-                // Persist player state so restart keeps inventory/gamemode (otherwise starter kit)
-                try {
-                    Player p = (Player) fp;
-                    s.gameMode = p.getGameMode().name();
-                    s.health = p.getHealth();
-                    s.foodLevel = p.getFoodLevel();
-                    s.saturation = p.getSaturation();
-                    s.exhaustion = p.getExhaustion();
-                    s.exp = p.getExp();
-                    s.level = p.getLevel();
-                    s.totalExperience = p.getTotalExperience();
-                    s.inventory = serializeItems(p.getInventory().getStorageContents());
-                    s.armor = serializeItems(p.getInventory().getArmorContents());
-                    var off = p.getInventory().getItemInOffHand();
-                    if (off != null && !off.getType().isAir()) s.offHand = off.serialize();
-                    else s.offHand = null;
-                    s.enderChest = serializeItems(p.getEnderChest().getStorageContents());
-                    s.potionEffects = new ArrayList<>();
-                    for (var eff : p.getActivePotionEffects()) s.potionEffects.add(eff.serialize());
-                } catch (Exception ex) {
-                    plugin.getLogger().warning("Failed to snapshot inventory for " + s.name + ": " + ex.getMessage());
-                }
-                list.add(s);
-            }
-            if (!plugin.getDataFolder().exists()) plugin.getDataFolder().mkdirs();
-            try (FileWriter w = new FileWriter(persistFile)) {
-                gson.toJson(list, w);
-            }
+            f.saveAll(persistFile);
         } catch (Exception e) {
             plugin.getLogger().log(Level.WARNING, "Failed to save unplugged.json", e);
         }
     }
 
-    private java.util.List<java.util.Map<String, Object>> serializeItems(org.bukkit.inventory.ItemStack[] items) {
-        var out = new ArrayList<java.util.Map<String, Object>>();
-        for (var it : items) {
-            if (it == null || it.getType().isAir()) out.add(null);
-            else out.add(it.serialize());
+    /**
+     * Debounced save — schedules a disk write at most once every 2 seconds.
+     * Call this instead of {@link #saveAll()} when persistence should be updated
+     * but immediate I/O is not required.
+     */
+    public void saveAllDebounced() {
+        long now = System.currentTimeMillis();
+        if (now - lastSaveMillis < 2000) {
+            savePending = true;
+            if (saveTaskId == -1) {
+                saveTaskId = Bukkit.getScheduler().runTaskLater(plugin, () -> {
+                    saveTaskId = -1;
+                    if (savePending) {
+                        savePending = false;
+                        lastSaveMillis = System.currentTimeMillis();
+                        saveAll();
+                    }
+                }, 40L).getTaskId();
+            }
+            return;
         }
-        return out;
+        lastSaveMillis = now;
+        saveAll();
     }
 
-    private org.bukkit.inventory.ItemStack[] deserializeItems(java.util.List<java.util.Map<String, Object>> list, int expected) {
-        var out = new org.bukkit.inventory.ItemStack[expected];
-        if (list == null) return out;
-        for (int i = 0; i < Math.min(list.size(), expected); i++) {
-            var m = list.get(i);
-            if (m == null) out[i] = null;
-            else try { out[i] = org.bukkit.inventory.ItemStack.deserialize(m); } catch (Exception ignored) { out[i] = null; }
-        }
-        return out;
-    }
-
-    private void restoreLiveDataFromSaved(Player dst, SavedFake s) {
-        try { if (s.gameMode != null) dst.setGameMode(org.bukkit.GameMode.valueOf(s.gameMode)); } catch (Exception ignored) {}
-        try { if (s.health > 0) dst.setHealth(Math.min(s.health, dst.getMaxHealth())); } catch (Exception ignored) {}
-        try { dst.setFoodLevel(s.foodLevel); } catch (Exception ignored) {}
-        try { dst.setSaturation(s.saturation); } catch (Exception ignored) {}
-        try { dst.setExhaustion(s.exhaustion); } catch (Exception ignored) {}
-        try { dst.setExp(s.exp); } catch (Exception ignored) {}
-        try { dst.setLevel(s.level); } catch (Exception ignored) {}
-        try { dst.setTotalExperience(s.totalExperience); } catch (Exception ignored) {}
+    public int loadAll() {
         try {
-            if (s.inventory != null) dst.getInventory().setStorageContents(deserializeItems(s.inventory, dst.getInventory().getStorageContents().length));
-            if (s.armor != null) dst.getInventory().setArmorContents(deserializeItems(s.armor, dst.getInventory().getArmorContents().length));
-            if (s.offHand != null) try { dst.getInventory().setItemInOffHand(org.bukkit.inventory.ItemStack.deserialize(s.offHand)); } catch (Exception ignored) {}
-            if (s.enderChest != null) dst.getEnderChest().setStorageContents(deserializeItems(s.enderChest, dst.getEnderChest().getStorageContents().length));
-            if (s.potionEffects != null) for (var m : s.potionEffects) try { dst.addPotionEffect(new org.bukkit.potion.PotionEffect(m)); } catch (Exception ignored) {}
-        } catch (Exception ignored) {}
-    }
-
-    public List<SavedFake> loadPersistedData() {
-        if (!persistFile.exists()) return List.of();
-        try (FileReader r = new FileReader(persistFile)) {
-            Type type = new TypeToken<List<SavedFake>>(){}.getType();
-            List<SavedFake> list = gson.fromJson(r, type);
-            return list != null ? list : List.of();
+            FakePlayerFactory f = factory();
+            if (f == null) return 0;
+            return f.loadAll(persistFile, null);
         } catch (Exception e) {
             plugin.getLogger().log(Level.WARNING, "Failed to load unplugged.json", e);
-            return List.of();
-        }
-    }
-
-    public void loadPersisted() {
-        // just ensure file exists; actual restore is delayed
-    }
-
-    public void restoreAllDelayed() {
-        List<SavedFake> saved = loadPersistedData();
-        if (saved.isEmpty()) return;
-        FakePlayerFactory f = factory();
-        if (f == null) return;
-        int restored = 0;
-        for (SavedFake s : saved) {
-            try {
-                UUID uuid = UUID.fromString(s.uuid);
-                // Skip if already active or if real player is online (real takes precedence)
-                if (f.isFakePlayer(uuid)) continue;
-                if (Bukkit.getPlayer(uuid) != null) continue; // real is online, don't respawn bot
-                long elapsedMinutes = (System.currentTimeMillis() - s.spawnTimeMillis) / 60000L;
-                long remaining = s.timeoutMinutes < 0 ? -1 : s.timeoutMinutes - elapsedMinutes;
-                if (s.timeoutMinutes >= 0 && remaining <= 0) continue; // expired while offline
-
-                World world = s.world != null ? Bukkit.getWorld(s.world) : null;
-                if (world == null) world = Bukkit.getWorlds().isEmpty() ? null : Bukkit.getWorlds().get(0);
-                if (world == null) continue;
-                Location loc = new Location(world, s.x, s.y, s.z, s.yaw, s.pitch);
-
-                // If elapsed >0, adjust timeout to remaining so original expiry is preserved
-                long timeoutToUse = s.timeoutMinutes < 0 ? -1 : remaining;
-
-                var builder = f.createBuilder(uuid, s.name)
-                    .world(world)
-                    .location(loc)
-                    .timeoutMinutes(timeoutToUse)
-                    .reason(s.reason)
-                    .damageDisabled(s.damageDisabled)
-                    .hidden(s.hidden)
-                    .resetHealthOnDeath(s.resetHealthOnDeath);
-                // Preserve original spawnTime semantics by spawning now but with remaining timeout
-                FakePlayer spawned = builder.spawn();
-                // Force-load for farm until WarpMC jar rebuilt (RegionizedPlayerChunkLoader fix)
-                try {
-                    var cx = loc.getBlockX() >> 4; var cz = loc.getBlockZ() >> 4;
-                    for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++)
-                        spawned.getWorld().addPluginChunkTicket(cx + dx, cz + dz, plugin);
-                } catch (Exception ignored) {}
-                // Restore persisted inventory/gamemode/health so restart doesn't reset to starter kit
-                try { restoreLiveDataFromSaved((Player) spawned, s); } catch (Exception ex) { plugin.getLogger().warning("Failed to restore inventory for " + s.name + ": " + ex.getMessage()); }
-                restored++;
-            } catch (Exception e) {
-                plugin.getLogger().log(Level.WARNING, "Failed to restore fake " + s.name + " (" + s.uuid + ")", e);
-            }
-        }
-        if (restored > 0) {
-            plugin.getLogger().info("Restored " + restored + " persisted AFK bots");
-            saveAll();
+            return 0;
         }
     }
 
@@ -405,5 +307,50 @@ public class AFKManager {
             for (UUID id : toRemove) f.removeFakePlayer(id);
         }
         if (persistFile.exists()) persistFile.delete();
+    }
+
+    /**
+     * Reads persisted fake player data directly from the unplugged.json file.
+     * Used by admin list commands to show tracked/offline players.
+     */
+    public List<Map<String, Object>> readPersistedData() {
+        List<Map<String, Object>> result = new ArrayList<>();
+        if (!persistFile.exists()) return result;
+        try (FileReader r = new FileReader(persistFile)) {
+            Type listType = new TypeToken<List<Map<String, Object>>>(){}.getType();
+            List<Map<String, Object>> list = gson.fromJson(r, listType);
+            if (list != null) result.addAll(list);
+        } catch (Exception ignored) {}
+        return result;
+    }
+
+    // --- Event handlers ---
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onFakeSpawn(FakePlayerSpawnEvent event) {
+        // Debounced auto-save after each spawn so persistence stays current
+        saveAllDebounced();
+        if (plugin.getConfig().getBoolean("main.debug", false)) {
+            plugin.getLogger().info("[WarpAFK] Bot spawned: " + event.getFakePlayer().getName());
+        }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onFakeRemove(FakePlayerRemoveEvent event) {
+        // Debounced auto-save after each removal
+        saveAllDebounced();
+
+        String name = event.getFakePlayerName();
+        if (name == null) {
+            plugin.getLogger().info("[WarpAFK] Bot removed: " + event.getFakePlayerUuid() + " (" + event.getReason() + ")");
+            return;
+        }
+
+        broadcastEnd(name, switch (event.getReason()) {
+            case TIMEOUT -> "expired";
+            case REAL_LOGIN -> "replaced";
+            case DEATH_NO_REVIVE -> "expired";
+            default -> "terminated";
+        });
     }
 }

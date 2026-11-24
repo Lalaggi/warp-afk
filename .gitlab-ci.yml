@@ -14,12 +14,8 @@
 #         gitlab-runner verify
 #         systemctl --user status gitlab-runner
 #
-# Register if missing:
-#   glab api projects/Lalaggi%2Fwarp-afk | grep runners_token
-#   gitlab-runner register --url https://gitlab.com \
-#     --registration-token GR1348941fGfD2nB8xyDi87hYNkpn \
-#     --description local-podman-warpAFK --tag-list "warp-afk,warp,local-podman" \
-#     --executor docker --docker-image "alpine:3.20"
+# Runner auth lives ONLY on the runner host (~/.gitlab-runner/config.toml, glrt-... token).
+# Never put credentials in this file — the repo is public and mirrored to GitHub/Codeberg.
 #   # then edit ~/.gitlab-runner/config.toml:
 #   #   [runners.docker]
 #   #     host = "unix:///run/user/1000/podman/podman.sock"

@@ -22,7 +22,7 @@ repositories {
 
 dependencies {
     // WarpMC's FakePlayerAPI — NOT upstream Purpur (custom impl in WarpMC). Needs WarpMC publishToMavenLocal.
-    compileOnly("org.purpurmc.purpur:purpur-api:26.1.2.local-SNAPSHOT")
+    compileOnly("org.purpurmc.purpur:purpur-api:26.2.local-SNAPSHOT")
     implementation("com.google.code.gson:gson:2.10.1")
 }
 
@@ -34,7 +34,7 @@ tasks.withType<JavaCompile> {
 tasks.processResources {
     val props = mapOf<String, String>(
         "version" to project.version.toString(),
-        "apiVersion" to (project.findProperty("apiVersion")?.toString() ?: "26.1.2")
+        "apiVersion" to (project.findProperty("apiVersion")?.toString() ?: "26.2")
     )
     inputs.properties(props)
     filesMatching("paper-plugin.yml") {

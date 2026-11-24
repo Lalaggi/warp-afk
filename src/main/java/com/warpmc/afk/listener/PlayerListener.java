@@ -9,8 +9,17 @@ import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
+import org.purpurmc.purpur.event.FakePlayerSpawnEvent;
+import org.purpurmc.purpur.event.FakePlayerRemoveEvent;
 import org.purpurmc.purpur.player.FakePlayer;
 
+/**
+ * Listens for fake player lifecycle events and real player join/quit.
+ * <p>
+ * Tab-list visibility is now handled by the FakePlayer API
+ * ({@code hiddenFromNonOps}), so this listener only manages broadcast
+ * messages for real players returning from AFK.
+ */
 public class PlayerListener implements Listener {
 
     private final WarpAFKPlugin plugin;
@@ -26,29 +35,49 @@ public class PlayerListener implements Listener {
         var player = event.getPlayer();
         var f = manager.factory();
         if (f == null) return;
-        // If real player rejoins and has active fake, the fake should have been removed in
-        // ServerLoginPacketListenerImpl already. But if plugin's persistence still has entry,
-        // ensure it's cleaned and optionally show return message.
-        if (f.isFakePlayer(player.getUniqueId())) {
-            // This shouldn't happen — fake should be gone — but handle if plugin spawned it.
-            // WarpMC's login hook already calls fake.remove(); we just save.
-            manager.saveAll();
-            if (plugin.getConfig().getBoolean("messages.broadcast", false)) {
-                var comp = Component.text(player.getName() + " returned — AFK bot removed", NamedTextColor.GRAY);
-                plugin.getServer().broadcast(comp);
+
+        // If real player joins and had an active fake that was evicted, suppress
+        // their join message if hide-join-leave is enabled (upstream hideUnpluggedJoin)
+        boolean hideJoinLeave = plugin.getConfig().getBoolean("messages.hide-join-leave", false);
+        if (hideJoinLeave) {
+            // Check if this player had a persisted AFK session that was just evicted
+            var persisted = manager.readPersistedData();
+            for (var s : persisted) {
+                try {
+                    if (s.get("uuid").toString().equals(player.getUniqueId().toString())) {
+                        event.joinMessage(null);
+                        break;
+                    }
+                } catch (Exception ignored) {}
             }
         }
-        // If fake is hidden and config says hide join, suppress join message
-        if (player instanceof FakePlayer fp && fp.isHidden() && plugin.getConfig().getBoolean("messages.hide-join-leave", false)) {
-            event.joinMessage(null);
+
+        // If real player joins and has an active fake, it should have been evicted
+        // by the server's login hook. Just save state.
+        if (f.isFakePlayer(player.getUniqueId())) {
+            manager.saveAll();
         }
     }
 
     @EventHandler(priority = EventPriority.MONITOR)
     public void onQuit(PlayerQuitEvent event) {
         var player = event.getPlayer();
-        if (player instanceof FakePlayer fp && fp.isHidden() && plugin.getConfig().getBoolean("messages.hide-join-leave", false)) {
+        // Suppress quit message for hidden fake players (handled by API, but
+        // double-suppress for safety if config says so)
+        if (player instanceof FakePlayer fp && fp.isHidden()
+            && plugin.getConfig().getBoolean("messages.hide-join-leave", false)) {
             event.quitMessage(null);
         }
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onFakeSpawn(FakePlayerSpawnEvent event) {
+        // FakePlayerSpawnEvent is also handled by AFKManager (saveAll).
+        // Any plugin-specific logic goes here.
+    }
+
+    @EventHandler(priority = EventPriority.MONITOR)
+    public void onFakeRemove(FakePlayerRemoveEvent event) {
+        // FakePlayerRemoveEvent is also handled by AFKManager (saveAll + broadcast).
     }
 }

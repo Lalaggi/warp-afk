@@ -1,26 +1,51 @@
 # WarpAFK — Unplugged-AFK port for WarpMC
 # Port of https://github.com/sakura-ryoko/unplugged-afk
+# Matches upstream unplugged_afk.json structure
 
 main:
+  # Master toggle — matches upstream `unpluggedAfkEnabled`
   enabled: true
+  # Verbose debug logging
   debug: false
+  # Reduced output for /unplugged-admin list|info (true = compact, false = full debug)
+  reduced-list-debug-info: true
+  # Enables advanced admin subcommands: set, advanced info/list output
+  advanced-admin-options: false
 
 unplugged:
-  # Default timeout in minutes (129600 = 90 days like upstream). -1 = never.
+  # Default timeout in minutes (129600 = 90 days like upstream). -1 = never expire.
   default-timeout-minutes: 129600
-  reset-health-on-death: true
+  # Reset health to full on fake death (auto-revive). false = bot dies and is removed.
+  reset-health-on-death: false
+  # Disable all damage to fake players
   disable-damage: false
+  # Hide fake players from tab list / player selectors (non-ops)
   hide-player: false
+  # Also hide from ops when hide-player is true. If hide-player false, this does nothing.
   hide-from-ops: false
 
+commands:
+  # Enable /unplug and /afk. Disable one or both if conflicting with other plugins (e.g. Essentials /afk)
+  enable-unplug: true
+  enable-afk: false
+
 messages:
-  # Whether to broadcast unplugged start/end to all players
+  # Broadcast unplugged start/return/expired messages to all players
   broadcast: false
+  # Suppress vanilla "player joined/left" for fake players
   hide-join-leave: false
-  # Kick message shown when player successfully unplugs
+  # Whether to append duration to broadcast messages (like upstream displayDuration)
+  display-duration: false
+  # Whether to send return feedback (reason why session ended) to returning player
+  display-return-feedback: false
+  # Kick message shown when player successfully unplugs (MiniMessage, legacy & codes also supported)
   kick-message: "<gold>Your player will be AFK"
-  # Broadcast formats (MiniMessage)
+  # Broadcast formats (MiniMessage). <player>, <reason>, <duration>, <timeDate> supported.
   started: "<gray><player> is now AFK (<reason>) for <duration>"
   ended: "<gray><player> is no longer AFK"
   expired: "<gray><player>'s AFK session expired"
   replaced: "<gray><player> returned — AFK bot removed"
+  # Extra upstream-style messages (optional)
+  terminated: "<gray><player>'s AFK session was terminated"
+  unsuccessful: "<gray>Your AFK session was interrupted"
+  successful: "<gray>Your session was successful"
